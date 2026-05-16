@@ -120,6 +120,9 @@ NUM_CHANNELS = 1
 OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_VOICE = "marin"
 
+TRANSLATION_INPUT_FLUSH_DELAY = 0.5
+TRANSLATION_OUTPUT_FALLBACK_DELAY = 1
+
 lk_oai_debug = int(os.getenv("LK_OPENAI_DEBUG", 0))
 
 # Azure OpenAI Realtime API uses old-style (beta) event names.
@@ -237,6 +240,10 @@ class _RealtimeOptions:
     conn_options: APIConnectOptions
     speed: float = 1.0
 
+    # translation fields
+    translation_enabled: bool = False
+    target_language: str | None = None
+
 
 @dataclass
 class _MessageGeneration:
@@ -288,6 +295,10 @@ class RealtimeModel(llm.RealtimeModel):
         max_session_duration: NotGivenOr[float | None] = NOT_GIVEN,
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
         temperature: NotGivenOr[float] = NOT_GIVEN,  # deprecated, unused in v1
+
+        translation_enabled:NotGivenOr[bool]  = NOT_GIVEN,
+        target_language: str | None = None
+
     ) -> None: ...
 
     @overload
@@ -318,6 +329,9 @@ class RealtimeModel(llm.RealtimeModel):
         max_session_duration: NotGivenOr[float | None] = NOT_GIVEN,
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
         temperature: NotGivenOr[float] = NOT_GIVEN,  # deprecated, unused in v1
+
+        translation_enabled: NotGivenOr[bool] = NOT_GIVEN,
+        target_language: str | None = None
     ) -> None: ...
 
     def __init__(
@@ -348,6 +362,9 @@ class RealtimeModel(llm.RealtimeModel):
         max_session_duration: NotGivenOr[float | None] = NOT_GIVEN,
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
         temperature: NotGivenOr[float] = NOT_GIVEN,  # deprecated, unused in v1
+
+        translation_enabled: NotGivenOr[bool] = NOT_GIVEN,
+        target_language: str | None = None
     ) -> None:
         """
         Initialize a Realtime model client for OpenAI or Azure OpenAI.
@@ -459,6 +476,8 @@ class RealtimeModel(llm.RealtimeModel):
             if is_given(max_session_duration)
             else DEFAULT_MAX_SESSION_DURATION,
             conn_options=conn_options,
+            translation_enabled=translation_enabled,
+            target_language=target_language
         )
         self._http_session = http_session
         self._http_session_owned = False
@@ -709,6 +728,7 @@ def process_base_url(
     is_azure: bool = False,
     azure_deployment: str | None = None,
     api_version: str | None = None,
+    is_translation: bool = False,
 ) -> str:
     if url.startswith("http"):
         url = url.replace("http", "ws", 1)
@@ -717,8 +737,12 @@ def process_base_url(
     query_params = parse_qs(parsed_url.query)
 
     # ensure "/realtime" is added if the path is empty OR "/v1"
+    #  use "/realtime/translations" for translation model
     if not parsed_url.path or parsed_url.path.rstrip("/") in ["", "/v1", "/openai", "/openai/v1"]:
-        path = parsed_url.path.rstrip("/") + "/realtime"
+        if is_translation:
+            path = parsed_url.path.rstrip("/") + "/realtime/translations"
+        else:
+            path = parsed_url.path.rstrip("/") + "/realtime"
     else:
         path = parsed_url.path
 
@@ -778,6 +802,15 @@ class RealtimeSession(
             SAMPLE_RATE, NUM_CHANNELS, samples_per_channel=SAMPLE_RATE // 10
         )
         self._pushed_duration_s: float = 0  # duration of audio pushed to the OpenAI Realtime API
+
+        # for translation event handler
+        self._translation_input_transcript: str = ""
+        self._translation_output_transcript: str = ""
+        self._translation_input_item_id: str | None = None
+        self._translation_output_item_id: str | None = None
+        self._translation_input_flush_handle: asyncio.TimerHandle | None = None
+        self._translation_output_flush_handle: asyncio.TimerHandle | None = None
+
 
     def send_event(self, event: RealtimeClientEvent | dict[str, Any]) -> None:
         with contextlib.suppress(utils.aio.channel.ChanClosed):
@@ -896,12 +929,15 @@ class RealtimeSession(
         else:
             headers["Authorization"] = f"Bearer {self._realtime_model._opts.api_key}"
 
+        is_translation = self._realtime_model._opts.translation_enabled
+
         url = process_base_url(
             self._realtime_model._opts.base_url,
             self._realtime_model._opts.model,
             is_azure=self._realtime_model._opts.is_azure,
             api_version=self._realtime_model._opts.api_version,
             azure_deployment=self._realtime_model._opts.azure_deployment,
+            is_translation=is_translation,
         )
 
         if lk_oai_debug:
@@ -993,65 +1029,84 @@ class RealtimeSession(
 
                         logger.debug(f"<<< {event_copy}")
 
-                    if event["type"] == "input_audio_buffer.speech_started":
-                        self._handle_input_audio_buffer_speech_started(
-                            InputAudioBufferSpeechStartedEvent.construct(**event)
-                        )
-                    elif event["type"] == "input_audio_buffer.speech_stopped":
-                        self._handle_input_audio_buffer_speech_stopped(
-                            InputAudioBufferSpeechStoppedEvent.construct(**event)
-                        )
-                    elif event["type"] == "response.created":
-                        self._handle_response_created(ResponseCreatedEvent.construct(**event))
-                    elif event["type"] == "response.output_item.added":
-                        self._handle_response_output_item_added(
-                            ResponseOutputItemAddedEvent.construct(**event)
-                        )
-                    elif event["type"] == "response.content_part.added":
-                        self._handle_response_content_part_added(
-                            ResponseContentPartAddedEvent.construct(**event)
-                        )
-                    elif event["type"] == "conversation.item.added":
-                        self._handle_conversion_item_added(ConversationItemAdded.construct(**event))
-                    elif event["type"] == "conversation.item.deleted":
-                        self._handle_conversion_item_deleted(
-                            ConversationItemDeletedEvent.construct(**event)
-                        )
-                    elif event["type"] == "conversation.item.input_audio_transcription.delta":
-                        # currently incoming transcripts are transcribed only after the user stops speaking
-                        # it's not very useful to emit these as the transcribe process takes place within ~100ms
-                        # when they handle streaming transcriptions, we'll handle it then.
-                        pass
-                    elif event["type"] == "conversation.item.input_audio_transcription.completed":
-                        self._handle_conversion_item_input_audio_transcription_completed(
-                            ConversationItemInputAudioTranscriptionCompletedEvent.construct(**event)
-                        )
-                    elif event["type"] == "conversation.item.input_audio_transcription.failed":
-                        self._handle_conversion_item_input_audio_transcription_failed(
-                            ConversationItemInputAudioTranscriptionFailedEvent.construct(**event)
-                        )
-                    elif event["type"] == "response.output_text.delta":
-                        self._handle_response_text_delta(ResponseTextDeltaEvent.construct(**event))
-                    elif event["type"] == "response.output_text.done":
-                        self._handle_response_text_done(ResponseTextDoneEvent.construct(**event))
-                    elif event["type"] == "response.output_audio_transcript.delta":
-                        self._handle_response_audio_transcript_delta(event)
-                    elif event["type"] == "response.output_audio.delta":
-                        self._handle_response_audio_delta(
-                            ResponseAudioDeltaEvent.construct(**event)
-                        )
-                    elif event["type"] == "response.output_audio.done":
-                        self._handle_response_audio_done(ResponseAudioDoneEvent.construct(**event))
-                    elif event["type"] == "response.output_item.done":
-                        self._handle_response_output_item_done(
-                            ResponseOutputItemDoneEvent.construct(**event)
-                        )
-                    elif event["type"] == "response.done":
-                        self._handle_response_done(ResponseDoneEvent.construct(**event))
-                    elif event["type"] == "error":
-                        self._handle_error(RealtimeErrorEvent.construct(**event))
-                    elif lk_oai_debug:
-                        logger.debug(f"unhandled event: {event['type']}", extra={"event": event})
+                    if self._realtime_model._opts.translation_enabled:
+                        if event["type"] == "session.output_audio.delta":
+                            self._handle_translation_audio_delta(event)
+
+                        elif event["type"] == "session.output_audio.done":
+                            self._handle_translation_audio_done(event)
+
+                        elif event["type"] == "session.output_transcript.delta":
+                            self._handle_translation_output_transcript_delta(event)
+
+                        elif event["type"] == "session.input_transcript.delta":
+                            self._handle_translation_input_transcript_delta(event)
+
+                        elif lk_oai_debug:
+                            logger.debug(f"unhandled event: {event['type']}", extra={"event": event})
+
+                    else:
+                        if event["type"] == "input_audio_buffer.speech_started":
+                            self._handle_input_audio_buffer_speech_started(
+                                InputAudioBufferSpeechStartedEvent.construct(**event)
+                            )
+                        elif event["type"] == "input_audio_buffer.speech_stopped":
+                            self._handle_input_audio_buffer_speech_stopped(
+                                InputAudioBufferSpeechStoppedEvent.construct(**event)
+                            )
+                        elif event["type"] == "response.created":
+                            self._handle_response_created(ResponseCreatedEvent.construct(**event))
+                        elif event["type"] == "response.output_item.added":
+                            self._handle_response_output_item_added(
+                                ResponseOutputItemAddedEvent.construct(**event)
+                            )
+                        elif event["type"] == "response.content_part.added":
+                            self._handle_response_content_part_added(
+                                ResponseContentPartAddedEvent.construct(**event)
+                            )
+                        elif event["type"] == "conversation.item.added":
+                            self._handle_conversion_item_added(ConversationItemAdded.construct(**event))
+                        elif event["type"] == "conversation.item.deleted":
+                            self._handle_conversion_item_deleted(
+                                ConversationItemDeletedEvent.construct(**event)
+                            )
+                        elif event["type"] == "conversation.item.input_audio_transcription.delta":
+                            # currently incoming transcripts are transcribed only after the user stops speaking
+                            # it's not very useful to emit these as the transcribe process takes place within ~100ms
+                            # when they handle streaming transcriptions, we'll handle it then.
+                            pass
+                        elif event["type"] == "conversation.item.input_audio_transcription.completed":
+                            self._handle_conversion_item_input_audio_transcription_completed(
+                                ConversationItemInputAudioTranscriptionCompletedEvent.construct(**event)
+                            )
+                        elif event["type"] == "conversation.item.input_audio_transcription.failed":
+                            self._handle_conversion_item_input_audio_transcription_failed(
+                                ConversationItemInputAudioTranscriptionFailedEvent.construct(**event)
+                            )
+                        elif event["type"] == "response.output_text.delta":
+                            self._handle_response_text_delta(ResponseTextDeltaEvent.construct(**event))
+                        elif event["type"] == "response.output_text.done":
+                            self._handle_response_text_done(ResponseTextDoneEvent.construct(**event))
+                        elif event["type"] == "response.output_audio_transcript.delta":
+                            self._handle_response_audio_transcript_delta(event)
+                        elif event["type"] == "response.output_audio.delta":
+                            self._handle_response_audio_delta(
+                                ResponseAudioDeltaEvent.construct(**event)
+                            )
+                        elif event["type"] == "response.output_audio.done":
+                            self._handle_response_audio_done(ResponseAudioDoneEvent.construct(**event))
+                        elif event["type"] == "response.output_item.done":
+                            self._handle_response_output_item_done(
+                                ResponseOutputItemDoneEvent.construct(**event)
+                            )
+                        elif event["type"] == "response.done":
+                            self._handle_response_done(ResponseDoneEvent.construct(**event))
+                        elif event["type"] == "error":
+                            self._handle_error(RealtimeErrorEvent.construct(**event))
+
+                        elif lk_oai_debug:
+                            logger.debug(f"unhandled event: {event['type']}", extra={"event": event})
+
                 except Exception:
                     if event["type"] == "response.output_audio.delta":
                         event["delta"] = event["delta"][:10] + "..."
@@ -1112,6 +1167,41 @@ class RealtimeSession(
         # they do not support both text and audio modalities, it'll respond in audio + transcript
         modality = "audio" if "audio" in self._realtime_model._opts.modalities else "text"
         opts = self._realtime_model._opts
+
+        if opts.translation_enabled and opts.target_language is not None:
+            session_dict: dict[str, Any] = {
+                "audio": {
+                    "output": {
+                        "language": opts.target_language,
+                    },
+                },
+            }
+            # Only add noise_reduction/transcription if set
+            audio_input: dict[str, Any] = {}
+            if opts.input_audio_noise_reduction is not None:
+                audio_input["noise_reduction"] = opts.input_audio_noise_reduction.model_dump(
+                    by_alias=True, exclude_unset=True
+                )
+            if opts.input_audio_transcription is not None:
+                transcription_dict = opts.input_audio_transcription.model_dump(
+                    by_alias=True, exclude_unset=True
+                )
+                # Translation API does not accept 'language' inside transcription config
+                transcription_dict.pop("language", None)
+                if transcription_dict:
+                    audio_input["transcription"] = transcription_dict
+
+            if audio_input:
+                session_dict["audio"]["input"] = audio_input
+
+            return {
+                "type": "session.update",
+                "event_id": utils.shortuuid("session_update_"),
+                "session": session_dict,
+            }
+
+        audio_format = realtime.realtime_audio_formats.AudioPCM(rate=SAMPLE_RATE, type="audio/pcm")
+        modality = "audio" if "audio" in opts.modalities else "text"
 
         session = RealtimeSessionCreateRequest(
             type="realtime",
@@ -1330,6 +1420,8 @@ class RealtimeSession(
         return events
 
     async def update_tools(self, tools: list[llm.Tool]) -> None:
+        if self._realtime_model._opts.translation_enabled:
+            return
         async with self._update_fnc_ctx_lock:
             ev = self._create_tools_update_event(tools)
             self.send_event(ev)
@@ -1393,6 +1485,9 @@ class RealtimeSession(
         return event.model_dump(by_alias=True, exclude_unset=True, exclude_defaults=False)
 
     async def update_instructions(self, instructions: str) -> None:
+        if self._realtime_model._opts.translation_enabled:
+            self._instructions = instructions
+            return
         self.send_event(
             self._wrap_session_update(
                 event_id=utils.shortuuid("instructions_update_"),
@@ -1405,15 +1500,16 @@ class RealtimeSession(
         self._instructions = instructions
 
     def push_audio(self, frame: rtc.AudioFrame) -> None:
+        is_translation = self._realtime_model._opts.translation_enabled
+        append_type = "session.input_audio_buffer.append" if is_translation else "input_audio_buffer.append"
+
         for f in self._resample_audio(frame):
             data = f.data.tobytes()
             for nf in self._bstream.write(data):
-                self.send_event(
-                    InputAudioBufferAppendEvent(
-                        type="input_audio_buffer.append",
-                        audio=base64.b64encode(nf.data).decode("utf-8"),
-                    )
-                )
+                self.send_event({
+                    "type": append_type,
+                    "audio": base64.b64encode(nf.data).decode("utf-8"),
+                })
                 self._pushed_duration_s += nf.duration
 
     def push_video(self, frame: rtc.VideoFrame) -> None:
@@ -1909,3 +2005,231 @@ class RealtimeSession(
                 recoverable=recoverable,
             ),
         )
+
+    def _handle_translation_audio_delta(self, event: dict[str, Any]) -> None:
+        """Handle session.output_audio.delta from the translation endpoint."""
+        if self._current_generation is None:
+            self._current_generation = _ResponseGeneration(
+                message_ch=utils.aio.Chan(),
+                function_ch=utils.aio.Chan(),
+                messages={},
+                _created_timestamp=time.time(),
+                _done_fut=asyncio.Future(),
+            )
+            item_id = utils.shortuuid("translation_")
+            item_gen = _MessageGeneration(
+                message_id=item_id,
+                text_ch=utils.aio.Chan(),
+                audio_ch=utils.aio.Chan(),
+                modalities=asyncio.Future(),
+            )
+            item_gen.modalities.set_result(["audio", "text"])
+            self._current_generation.messages[item_id] = item_gen
+            self._current_generation.message_ch.send_nowait(
+                llm.MessageGeneration(
+                    message_id=item_id,
+                    text_stream=item_gen.text_ch,
+                    audio_stream=item_gen.audio_ch,
+                    modalities=item_gen.modalities,
+                )
+            )
+            self.emit(
+                "generation_created",
+                llm.GenerationCreatedEvent(
+                    message_stream=self._current_generation.message_ch,
+                    function_stream=self._current_generation.function_ch,
+                    user_initiated=False,
+                    response_id=item_id,
+                ),
+            )
+
+        item_gen = next(iter(self._current_generation.messages.values()))
+        if self._current_generation._first_token_timestamp is None:
+            self._current_generation._first_token_timestamp = time.time()
+
+        data = base64.b64decode(event["delta"])
+        item_gen.audio_ch.send_nowait(
+            rtc.AudioFrame(
+                data=data,
+                sample_rate=SAMPLE_RATE,
+                num_channels=NUM_CHANNELS,
+                samples_per_channel=len(data) // 2,
+            )
+        )
+
+    def _handle_input_audio_buffer_speech_started(
+            self, _: InputAudioBufferSpeechStartedEvent
+    ) -> None:
+        # # For translation mode: user started speaking = previous assistant turn is DONE
+        # if self._realtime_model._opts.target_language is not None:
+        #     self._flush_translation_output_now()  # close assistant turn immediately
+        #
+        # self.emit("input_speech_started", llm.InputSpeechStartedEvent())
+
+        if self._realtime_model._opts.target_language is not None:
+            # 1. Cancel input flush timer — don't emit user item yet
+            if self._translation_input_flush_handle:
+                self._translation_input_flush_handle.cancel()
+                self._translation_input_flush_handle = None
+
+            # 2. Flush assistant item FIRST (from previous turn)
+            self._flush_translation_output_now()
+
+            # 3. Also clear any stale input transcript from previous turn
+            #    (in case timer hadn't fired yet)
+            self._translation_input_transcript = ""
+
+        self.emit("input_speech_started", llm.InputSpeechStartedEvent())
+
+    def _handle_input_audio_buffer_speech_stopped(
+            self, _: InputAudioBufferSpeechStoppedEvent
+    ) -> None:
+        user_transcription_enabled = (
+                self._realtime_model._opts.input_audio_transcription is not None
+        )
+        self.emit(
+            "input_speech_stopped",
+            llm.InputSpeechStoppedEvent(
+                user_transcription_enabled=user_transcription_enabled
+            ),
+        )
+
+    def _flush_translation_input(self) -> None:
+        """500ms after last input delta — emit ONE complete user item."""
+        self._translation_input_flush_handle = None
+
+        transcript = self._translation_input_transcript.strip()
+        self._translation_input_transcript = ""  # always reset even if empty
+
+        if not transcript:
+            return
+
+        item_id = utils.shortuuid("translation_user_")
+        self._translation_input_item_id = item_id
+
+        lk_item = llm.ChatMessage(
+            id=item_id,
+            role="user",
+            content=[transcript],
+        )
+        self._remote_chat_ctx.insert(None, lk_item)
+        self.emit(
+            "remote_item_added",
+            llm.RemoteItemAddedEvent(previous_item_id=None, item=lk_item),
+        )
+        self.emit(
+            "input_audio_transcription_completed",
+            llm.InputTranscriptionCompleted(
+                item_id=item_id,
+                transcript=transcript,
+                is_final=True,
+                confidence=None,
+            ),
+        )
+
+    def _handle_translation_input_transcript_delta(self, event: dict[str, Any]) -> None:
+        delta = event.get("delta", "")
+        if not delta:
+            return
+
+        self._translation_input_transcript += delta
+
+        # Interim display only
+        self.emit(
+            "input_audio_transcription_completed",
+            llm.InputTranscriptionCompleted(
+                item_id=self._translation_input_item_id or utils.shortuuid("src_"),
+                transcript=self._translation_input_transcript,
+                is_final=False,
+                confidence=None,
+            ),
+        )
+
+        # Reset 500ms flush timer
+        if self._translation_input_flush_handle:
+            self._translation_input_flush_handle.cancel()
+        self._translation_input_flush_handle = asyncio.get_event_loop().call_later(
+            0.5, self._flush_translation_input
+        )
+
+    def _flush_translation_output_now(self) -> None:
+        """Emit ONE complete assistant item — triggered by speech_started (VAD)."""
+
+        # Cancel fallback timer if VAD triggered us first
+        if self._translation_output_flush_handle:
+            self._translation_output_flush_handle.cancel()
+            self._translation_output_flush_handle = None
+
+        transcript = self._translation_output_transcript.strip()
+        self._translation_output_transcript = ""  # always reset
+
+        # Close generation channels
+        if self._current_generation:
+            for ig in self._current_generation.messages.values():
+                if not ig.audio_ch.closed:
+                    ig.audio_ch.close()
+                if not ig.text_ch.closed:
+                    ig.text_ch.close()
+            self._current_generation.function_ch.close()
+            self._current_generation.message_ch.close()
+            with contextlib.suppress(asyncio.InvalidStateError):
+                self._current_generation._done_fut.set_result(None)
+            self._current_generation = None
+
+        if not transcript:
+            return
+
+        item_id = utils.shortuuid("translation_asst_")
+        previous_id = self._translation_input_item_id  # user item from PREVIOUS turn
+
+        lk_item = llm.ChatMessage(
+            id=item_id,
+            role="assistant",
+            content=[transcript],
+        )
+        self._remote_chat_ctx.insert(previous_id, lk_item)
+        self._translation_output_item_id = item_id
+
+        self.emit(
+            "remote_item_added",
+            llm.RemoteItemAddedEvent(
+                previous_item_id=previous_id,
+                item=lk_item,
+            ),
+        )
+
+    def _handle_translation_output_transcript_delta(self, event: dict[str, Any]) -> None:
+        delta = event.get("delta", "")
+        if not delta:
+            return
+
+        self._translation_output_transcript += delta
+
+        # Feed into text channel for live display
+        if self._current_generation:
+            item_gen = next(iter(self._current_generation.messages.values()), None)
+            if item_gen and not item_gen.text_ch.closed:
+                item_gen.text_ch.send_nowait(delta)
+
+        # Fallback timer — fires if user never speaks (VAD never triggers)
+        if self._translation_output_flush_handle:
+            self._translation_output_flush_handle.cancel()
+        self._translation_output_flush_handle = asyncio.get_event_loop().call_later(
+            TRANSLATION_OUTPUT_FALLBACK_DELAY, self._flush_translation_output_now
+        )
+
+    def _handle_translation_audio_done(self, event: dict[str, Any]) -> None:
+        """Only called if API sends audio done — safe fallback."""
+        # Don't flush here — wait for VAD (speech_started) to be the boundary
+        # Only close channels if somehow generation is still open
+        if self._current_generation:
+            for ig in self._current_generation.messages.values():
+                if not ig.audio_ch.closed:
+                    ig.audio_ch.close()
+                if not ig.text_ch.closed:
+                    ig.text_ch.close()
+            self._current_generation.function_ch.close()
+            self._current_generation.message_ch.close()
+            with contextlib.suppress(asyncio.InvalidStateError):
+                self._current_generation._done_fut.set_result(None)
+            self._current_generation = None
